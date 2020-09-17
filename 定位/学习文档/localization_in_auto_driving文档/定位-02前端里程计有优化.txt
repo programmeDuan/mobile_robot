@@ -1,0 +1,98 @@
+二、优化事项
+1. 功能模块降耦合
+前端按照模块可以分为匹配、滤波、局部地图滑窗、全局地图等，其中前两者是可以独立成为通用模块的。比如匹配，
+不仅我们前端里程计要用，以后闭环修正也要用，地图建完以后，基于地图做定位还要用，所以它应该具有共用性。
+滤波也一样，上面提到的各个环节它也参与。
+
+接口，对于匹配，输入的是点云，输出的是位姿。对于滤波，输入输出都是点云。
+为实现多态：
+定义了一个基类RegistrationInterface，它执行匹配的函数是ScanMatch()，NDTRegistration和ICPRegistration都是
+RegistrationInterface的子类，定义registration_ptr作为类对象的指针，那么registration_ptr->ScanMatch()执行的
+到底是ndt匹配还是icp匹配，取决于定义指针时用哪个子类做的实例化，具体来讲就是下面的指令。如果使用第一行
+初始化，则执行的是NDT匹配，如果是用第二行初始化，则执行的是ICP匹配。
+// 使用ndt匹配
+std::shared_ptr<RegistrationInterface> registration_ptr = std::make_shared<NDTRegistration>();
+// 使用icp匹配
+std::shared_ptr<RegistrationInterface> registration_ptr = std::make_shared<ICPRegistration>();
+
+新建一个文件夹，名为models，存储匹配和滤波这两个类，以及以后可能新增的通用模块。
+
+匹配类NDTRegistration内部主要函数为SetInputTarget和ScanMatch，作用分别是输入目标点云和执行点云匹配，并输出匹配后位姿。
+
+bool NDTRegistration::SetInputTarget(const CloudData::CLOUD_PTR& input_target) {
+    ndt_ptr_->setInputTarget(input_target);
+
+    return true;
+}
+
+bool NDTRegistration::ScanMatch(const CloudData::CLOUD_PTR& input_source, 
+                                const Eigen::Matrix4f& predict_pose, 
+                                CloudData::CLOUD_PTR& result_cloud_ptr,
+                                Eigen::Matrix4f& result_pose) {
+    ndt_ptr_->setInputSource(input_source);
+    ndt_ptr_->align(*result_cloud_ptr, predict_pose);
+    result_pose = ndt_ptr_->getFinalTransformation();
+
+    return true;
+}
+
+2. 配置文件
+为了方便调试，常用参数写在配置文件里是必须的，本工程采用yaml格式作为配置文件格式，在程序中，它可以把参数内容对应的放到YAML::Node
+格式的变量中，前端里程计的配置参数放在config/front_end文件夹下，为了把配置文件内容传入刚才所提到的匹配和滤波两个模块，每个模块均增加
+一个构造函数，函数参数就是YAML::Node类型，同时基类指针用哪个子类实例化也可以由配置参数决定。
+
+在front_end.cpp中就对应有两个函数InitRegistration和InitFilter，分别匹配和滤波模块的子类选择与参数配置功能。
+
+3. 关键帧点云和地图保存功能
+我们的关键帧点云和全局地图都是放在内存里，这样是不利于大场景建图的，内存爆掉都是有可能的。所以我们的做法是没产生一个关键帧就把它存放在
+硬盘里，然后把点云释放掉，全局地图默认不生成，必须主动发送指令才会生成，生成之后会把地图保存成pcd文件，并在rviz上显示，最后再重新把地图释放掉，清理内存。
+
+本工程对应的生成地图的指令是 rosservice call /save_map
+
+地图默认路径是在工程目录下的slam_data文件夹下，您也可以在刚才提到的配置文件中自己定义路径，第一行的data_path变量就是它了。
+
+注意，这样修改之后，运行程序时只显示局部地图，只有在主动发送地图生成命令时才生成并显示全局地图，所以数据处理结束输入一次看一下完整地图就行。
+
+4. ROS流程封装
+
+node文件的main函数中实现的功能有
+
+读数据
+判断是否有数据
+初始化标定文件
+初始化gnss
+使用里程计模块计算数据
+发送数据
+
+把对应的流程封装在一个类里，所有通用变量放在头文件里作为类成员变量，各个步骤作为一个函数封装好，最后只留一个Run()函数作为接口给node文件去调用，
+bool FrontEndFlow::Run() {
+    ReadData(); //读数据
+
+    if (!InitCalibration()) //初始化标定文件
+        return false;
+
+    if (!InitGNSS())//初始化gnss
+        return false;
+    
+    while(HasData()) {//判断是否有数据
+        if (!ValidData())
+            continue;
+        UpdateGNSSOdometry();//使用里程计模块计算数据
+        if (UpdateLaserOdometry())
+            PublishData();//发送数据
+    }
+
+    return true;
+}
+
+此时node文件main函数就剩下类对象定义和调用了
+_front_end_flow_ptr = std::make_shared<FrontEndFlow>(nh);
+
+ros::Rate rate(100);
+while (ros::ok()) {
+    ros::spinOnce();
+
+    _front_end_flow_ptr->Run();
+
+    rate.sleep();
+}

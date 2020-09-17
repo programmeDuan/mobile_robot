@@ -1,0 +1,61 @@
+二、实现方法
+
+一共分两步：存数据和评价
+1. 数据存储
+发布里程计的函数PublishData前面再加一个函数SaveTrajectory去存储数据就好。
+
+自然需要的就是创建文件夹、创建txt文件、往文件里写数据了。
+bool FrontEndFlow::SaveTrajectory() {
+    static std::ofstream ground_truth, laser_odom;
+    static bool is_file_created = false;
+    if (!is_file_created) {
+        if (!FileManager::CreateDirectory(WORK_SPACE_PATH + "/slam_data/trajectory"))
+            return false;
+        if (!FileManager::CreateFile(ground_truth, WORK_SPACE_PATH + "/slam_data/trajectory/ground_truth.txt"))
+            return false;
+        if (!FileManager::CreateFile(laser_odom, WORK_SPACE_PATH + "/slam_data/trajectory/laser_odom.txt"))
+            return false;
+        is_file_created = true;
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            ground_truth << gnss_odometry_(i, j);
+            laser_odom << laser_odometry_(i, j);
+            if (i == 2 && j == 3) {
+                ground_truth << std::endl;
+                laser_odom << std::endl;
+            } else {
+                ground_truth << " ";
+                laser_odom << " ";
+            }
+        }
+    }
+
+    return true;
+}
+
+由于创建文件夹和创建文件这类功能是通用功能，所以我们在工程目录tools文件夹下定义一个FileManager类，专门存放此类小功能。
+
+其中此处两个功能对应的函数就分别是CreateDirectory和CreateFile。
+
+存数据就是往txt文件里写两个位姿矩阵。
+
+2. EVO评价
+1）安装EVO
+可以直接pip安装
+pip install evo --upgrade --no-binary evo
+
+2）使用EVO评价数据
+EVO评价数据有两种模式，对应的指令分别是 evo_rpe 和 evo_ape ，前者评价的是每段距离内的误差，后者评价的是绝对误差随路程的累计。
+评价每段距离内的误差可以使用如下指令：
+evo_rpe kitti ground_truth.txt laser_odom.txt -r trans_part --delta 100 --plot --plot_mode xyz
+其中--delta 100表示的是每隔100米统计一次误差，这样统计的其实就是误差的百分比，和kitti的odometry榜单中的距离误差指标就可以直接对应了。
+
+评价总累计误差可以用如下指令：
+evo_ape kitti ground_truth.txt laser_odom.txt -r full --plot --plot_mode xyz
+
+
+
+
+

@@ -1,0 +1,101 @@
+时间同步包括两个步骤：
+1）首先保证时钟源是一致的
+因为时钟源都有钟漂，而且每个时钟源钟漂不同，所以即使把各个传感器时间戳在初始时刻对齐，运行一段时间之后，之前对齐的结果就会偏离。
+解决这个问题的办法就是在硬件上把时钟源统一，常见的做法是做一个脉冲发生器，所有传感器都被这个脉冲触发，每次触发都校正一次自己的
+时钟，这样就可以消除时钟源的累计误差。
+
+在自动驾驶的传感器配置里，GNSS是一个必备的传感器，它自带秒脉冲发生器，所以可以直接使用。而且GNSS信号能够达到定位要求时，
+自身时钟也会受到卫星上原子钟的校正，从而进一步提高精度。大家可能对GNSS的定位功能比较熟悉，其实它的授时功能是和定位同等重
+要的功能，现在很多系统里都已经改变说法，不再把这类东西只称作定位系统，而是称作定位授时系统。
+
+2）获取同一时刻的信息
+在解决硬件同步以后，我们只能保证时间差没有累计漂移了，但是各个传感器的采集时刻并不是相同的。比如，在kitti数据集了，雷达和
+IMU都是10HZ，也就是100ms的周期，但是雷达每次采集的时间要比IMU慢个几十毫秒，当我们想获得在雷达采集时刻的车体角速度和
+加速度信息时，就要根据雷达前后时刻的IMU信息，通过插值计算出一个等效值，这就是获取同一时刻信息的含义。
+
+二、同步方法
+同步就是插值。
+关于插入时刻问题，因为我们是以雷达作为核心传感器，所以每收到一次雷达数据，就以当前雷达数据采集时刻作为要插入的时间点，
+从而获得除雷达以外的其他传感器的同一时刻等效信息
+差值拆分成两步：索引和插值计算
+想插值获取某一时间点的等效信息，就需要索引获得这一时间点前后的两帧数据，有了前后两帧数据的采集时刻，
+以及要插入的时刻，那么就是一个比例计算的问题了。
+
+1. 程序结构设计
+在front_end_flow.cpp文件中的ReadData函数里添加这段功能。
+ros的缓冲区里把所有传感器数据取出来，雷达不需要做插值，所以直接放在cloud_data_buff_容器里，其他传感器原始数据放在未做
+同步的临时容器里，包括IMU信息(unsynced_imu_)、速度信息(unsynced_velocity_)、GNSS信息(unsynced_gnss_)
+
+cloud_sub_ptr_->ParseData(cloud_data_buff_);
+
+static std::deque<IMUData> unsynced_imu_;
+static std::deque<VelocityData> unsynced_velocity_;
+static std::deque<GNSSData> unsynced_gnss_;
+
+imu_sub_ptr_->ParseData(unsynced_imu_);
+velocity_sub_ptr_->ParseData(unsynced_velocity_);
+gnss_sub_ptr_->ParseData(unsynced_gnss_);
+
+
+接下来要做的就是做同步了，由于每个传感器都要做一次同步，如果都放在front_end_flow.cpp文件中，会显得繁琐，所以我们把每个
+传感器的同步功能放在sensor_data文件夹下对应的传感器类文件中，ReadData函数只是调用这个功能函数，这样在ReadData函数下只需要实现三行程序
+bool valid_imu = IMUData::SyncData(unsynced_imu_, imu_data_buff_, cloud_time);
+bool valid_velocity = VelocityData::SyncData(unsynced_velocity_, velocity_data_buff_, cloud_time);
+bool valid_gnss = GNSSData::SyncData(unsynced_gnss_, gnss_data_buff_, cloud_time);
+
+他们分别是IMU信息、速度信息和GNSS信息的时间同步的实现。每个传感器的类都包含一个SyncData函数，在函数内部实现该传感器对应的同步操作，具体讲就是索引和插值操作。
+
+2. 时间索引
+
+由于数据在容器里都是按照时间先后排列的，每个容器相当于构建了一条时间线。索引要做的就是把雷达采集时刻在其他传感器的时间线里找到对应的位置，位置锁定，前后两帧的数据就自然有了。
+
+在索引时需要考虑一些异常情况，因为传感器难免会有一些丢帧或者时间戳出问题的情况，要避免其对程序功能产生影响
+
+我们以IMU数据的索引为例来介绍具体步骤，其他传感器步骤一致。
+
+while (UnsyncedData.size() >= 2) {
+    if (UnsyncedData.front().time > sync_time) 
+        return false;
+    if (UnsyncedData.at(1).time < sync_time) {
+        UnsyncedData.pop_front();
+        continue;
+    }
+    if (sync_time - UnsyncedData.front().time > 0.2) {
+        UnsyncedData.pop_front();
+        return false;
+    }
+    
+    if (UnsyncedData.at(1).time - sync_time > 0.2) {
+        UnsyncedData.pop_front();
+        return false;
+    }
+    break;
+}
+
+上面这段就是索引所需要的四个步骤，核心思想是让容器第一个数据时间比插入时刻早，第二个数据时间比插入时刻晚：
+1）如果第一个数据时间比雷达时间还要靠后，即插入时刻的前面没有数据，那么就无从插入，直接退出
+2）如果第一个数据比插入时刻早，第二个数据也比插入时刻早，那么第一个时刻的数据是没意义的，应该接着往下找，并删除第一个数据
+3）如果雷达采集时刻已经处在前两个数据的中间了，但是第一个数据时刻与雷达采集时刻时间差过大，那么中间肯定丢数据了，退出
+4）同样，如果第二个数据时刻与雷达采集时刻时间差过大，那么也是丢数据了，也退出
+
+以上四个限制条件如果都通过了，那么就算是找到对应位置了。
+
+3. 数据插值
+线性插值大家都懂，有两个数据a和b，时刻分别是0和1，那么时间t（0<t<1）时刻的插值就是a*(1-t)+b*t。
+double front_scale = (back_data.time - sync_time) / (back_data.time - front_data.time);
+double back_scale = (sync_time - front_data.time) / (back_data.time - front_data.time);
+synced_data.time = sync_time;
+synced_data.linear_acceleration.x = front_data.linear_acceleration.x * front_scale + back_data.linear_acceleration.x * back_scale;
+synced_data.linear_acceleration.y = front_data.linear_acceleration.y * front_scale + back_data.linear_acceleration.y * back_scale;
+synced_data.linear_acceleration.z = front_data.linear_acceleration.z * front_scale + back_data.linear_acceleration.z * back_scale;
+synced_data.angular_velocity.x = front_data.angular_velocity.x * front_scale + back_data.angular_velocity.x * back_scale;
+synced_data.angular_velocity.y = front_data.angular_velocity.y * front_scale + back_data.angular_velocity.y * back_scale;
+synced_data.angular_velocity.z = front_data.angular_velocity.z * front_scale + back_data.angular_velocity.z * back_scale;
+// 四元数插值有线性插值和球面插值，球面插值更准确，但是两个四元数差别不大是，二者精度相当
+// 由于是对相邻两时刻姿态插值，姿态差比较小，所以可以用线性插值
+synced_data.orientation.x = front_data.orientation.x * front_scale + back_data.orientation.x * back_scale;
+synced_data.orientation.y = front_data.orientation.y * front_scale + back_data.orientation.y * back_scale;
+synced_data.orientation.z = front_data.orientation.z * front_scale + back_data.orientation.z * back_scale;
+synced_data.orientation.w = front_data.orientation.w * front_scale + back_data.orientation.w * back_scale;
+// 线性插值之后要归一化
+synced_data.orientation.Normlize();
