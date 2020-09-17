@@ -22,6 +22,3 @@ g2o相关的封装放在models/graph_optimizer/g2o文件夹下。自定义的边放在models/graph_
 这样层级分布应该还算明确。
 
 对优化算法的调用仍然在之前介绍的back_end模块的back_end.cpp文件里。
-
-三、代码实现
-此处的代码实现，重点包括三部分：一是g2o自定义边，二是g2o优化算法封装，三是back_end对优化算法的调用。
