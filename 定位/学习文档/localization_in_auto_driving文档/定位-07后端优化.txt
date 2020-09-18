@@ -22,3 +22,114 @@ g2o相关的封装放在models/graph_optimizer/g2o文件夹下。自定义的边放在models/graph_
 这样层级分布应该还算明确。
 
 对优化算法的调用仍然在之前介绍的back_end模块的back_end.cpp文件里。
+
+三、代码实现
+此处的代码实现，重点包括三部分：一是g2o自定义边，二是g2o优化算法封装，三是back_end对优化算法的调用。
+1. g2o自定义边
+这里需要定义的边是用来输入观测量的先验边。
+kitti数据集可用的观测量包括GNSS位置和GNSS姿态两个，对这个问题，我们做一个小的讨论。
+另一方面，GNSS组合导航系统中，位置观测往往都是有RTK高精度信息做基础的，相对更准确，而姿态是通过导航系统里对位置误差
+的观测反向推导的，往往稍差，但这并不是说姿态不能用来做观测，而是在使用之前要对导航系统做足够的评估，确认其姿态精度是
+能够达到做观测的要求的，这个评估往往又需要一个更高精度的导航系统做基准。对于kitti数据集提供的数据，我们也无法再去做这
+样的工作，所以此处我们仅以位置作为观测量，而不使用姿态观测。
+
+如果各位有意愿，就是非常想尝试一下姿态观测的效果，我在代码里也定义了姿态观测的边，您可以直接使用这个自行把姿态观测
+加进去，本篇文章中就不再对这个内容做过多介绍了。
+
+每条边的内容，本质就是添加观测和计算误差，在位置观测对应的边里，这两步的代码如下
+
+void setMeasurement(const Eigen::Vector3d& m) override {
+	_measurement = m;
+}
+
+void computeError() override {
+	const g2o::VertexSE3* v1 = static_cast<const g2o::VertexSE3*>(_vertices[0]);
+
+	Eigen::Vector3d estimate = v1->estimate().translation();
+	_error = estimate - _measurement;
+}
+
+其中位置以三维向量的形式存在，位置误差就是观测向量和状态估计向量之差。
+2. 优化算法封装
+
+把优化算法的接口封装成以下函数：
+
+// 优化
+bool Optimize();
+// 输出数据
+bool GetOptimizedPose(std::deque<Eigen::Matrix4f>& optimized_pose);
+int GetNodeNum();
+// 添加节点、边、鲁棒核
+void SetEdgeRobustKernel(std::string robust_kernel_name, double robust_kernel_size);
+void AddSe3Node(const Eigen::Isometry3d &pose, bool need_fix);
+void AddSe3Edge(int vertex_index1,
+                int vertex_index2,
+                const Eigen::Isometry3d &relative_pose,
+                const Eigen::VectorXd noise);
+void AddSe3PriorXYZEdge(int se3_vertex_index,
+                        const Eigen::Vector3d &xyz,
+                        Eigen::VectorXd noise);
+void AddSe3PriorQuaternionEdge(int se3_vertex_index,
+                                const Eigen::Quaterniond &quat,
+                                Eigen::VectorXd noise);
+
+里面需要说明的是，每条边的输入参数里有一个noise，这个就是这条边对应的信息的噪声，在g2o里体现为信息矩阵，其实就是该信息在优化过程中的权重。
+
+噪声的大小可以在配置文件里设置，里程计、GNSS、闭环检测各对应一个噪声向量。
+
+3. 优化算法调用
+把添加顶点、边的功能封装在一个函数里，当有新的关键帧到来时调用该函数
+bool BackEnd::AddNodeAndEdge(const PoseData& gnss_data) {
+    Eigen::Isometry3d isometry;
+    // 添加关键帧节点
+    isometry.matrix() = current_key_frame_.pose.cast<double>();
+    graph_optimizer_ptr_->AddSe3Node(isometry, false);
+    new_key_frame_cnt_ ++;
+
+    // 添加激光里程计对应的边
+    static KeyFrame last_key_frame = current_key_frame_;
+    int node_num = graph_optimizer_ptr_->GetNodeNum();
+    if (node_num > 1) {
+        Eigen::Matrix4f relative_pose = last_key_frame.pose.inverse() * current_key_frame_.pose;
+        isometry.matrix() = relative_pose.cast<double>();
+        graph_optimizer_ptr_->AddSe3Edge(node_num-2, node_num-1, isometry, graph_optimizer_config_.odom_edge_noise);
+    }
+    last_key_frame = current_key_frame_;
+
+    // 添加gnss位置对应的先验边
+    if (graph_optimizer_config_.use_gnss) {
+        Eigen::Vector3d xyz(static_cast<double>(gnss_data.pose(0,3)),
+                            static_cast<double>(gnss_data.pose(1,3)),
+                            static_cast<double>(gnss_data.pose(2,3)));
+        graph_optimizer_ptr_->AddSe3PriorXYZEdge(node_num - 1, xyz, graph_optimizer_config_.gnss_noise);
+        new_gnss_cnt_ ++;
+    }
+
+    return true;
+}
+
+剩下的就是优化了。
+
+由于优化本身要耗一定时间，而且优化完之后，优化后的位姿要发送给viewer模块，后者利用优化后的信息生成全局点云地图，并在rviz上显示。
+全局点云地图本身比较大，产生和发送地图都非常耗时间，所以我们目前把优化控制在一个很低的频率上。
+
+这个优化频率在配置文件里有对应的参数，含义如下：
+
+optimize_step_with_key_frame：当新到关键帧计数达到这个值时做一次优化
+
+optimize_step_with_gnss：当新产生产生的gnss观测技术达到这个值时做一次优化
+
+optimize_step_with_loop：当新得到闭环检测边的计数达到这个值时做一次优化
+
+当这三个条件满足其中之一时，即做优化，并把三个计数均清零。
+
+但是，这会带来一个情况，就是当bag文件播放完之后，关键帧里的后面几帧可能并没有得到优化，因为上面三个条件计数还没达到新一次优化所需的数量要求。为了解决这个情况，我们提供了一个指令
+
+rosservice call /optimize_map
+
+输入这个指令之后，它会对当前所有的关键帧统一做一次优化，并用优化后的位姿重新产生一次全局地图，发送在rviz上。
+
+同时，以前文章所提到的保存点云地图的指令仍然有效
+
+rosservice call /save_map
+而且，如果在保存地图之前，用第一条指令执行一次优化，得到的地图会更精确。地图生成完之后终端上会提示地图保存路径。
